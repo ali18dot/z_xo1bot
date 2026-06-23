@@ -1,0 +1,1029 @@
+#!/usr/bin/env python3
+"""
+Protection Bot — runs as a standalone process spawned by the factory bot.
+Usage: python3 protection_bot.py --token TOKEN --data-file PATH --name NAME --owner-id UID
+"""
+import argparse
+import json
+import logging
+import os
+import re
+import datetime
+import io
+from collections import defaultdict, deque
+from pathlib import Path
+
+from telegram import (
+    Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup,
+    InputFile,
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ChatMemberHandler,
+    CallbackQueryHandler, filters, ContextTypes,
+)
+from telegram.constants import ChatMemberStatus
+from telegram.error import TelegramError
+
+logging.basicConfig(
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(name)
+
+BOT_VERSION = "2.0.0"
+
+# ── Spam detection ─────────────────────────────────────────────────────────────
+URL_RE = re.compile(
+    r"(https?://|www\.|t\.me/|telegram\.me/|bit\.ly/|tinyurl\.com/)\S+",
+    re.IGNORECASE,
+)
+SPAM_WORDS = [
+    "إعلان", "ربح سريع", "دخل يومي", "اشتراك مجاني", "كسب المال",
+    "استثمار", "عروض", "خصم", "مجاناً", "وظائف منزلية",
+    "crypto", "bitcoin", "investment", "forex", "profit",
+    "join now", "click here", "free money",
+]
+
+# ── In-memory flood tracker ────────────────────────────────────────────────────
+_flood: dict = defaultdict(lambda: defaultdict(deque))
+
+# ── In-memory state tracker {user_id: state} for private DM conversations ──────
+_state: dict[int, dict] = {}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_settings(data_file: str) -> dict:
+    if os.path.exists(data_file):
+        with open(data_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_settings(data_file: str, settings: dict) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(data_file)), exist_ok=True)
+    with open(data_file, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+
+def get_factory_config(settings: dict) -> dict:
+    return settings.get("_factory_config", {"channels": [], "custom_buttons": []})
+
+def get_bot_config(settings: dict) -> dict:
+    if "_bot_config" not in settings:
+        settings["_bot_config"] = {
+            "mandatory_channels": [],
+            "mandatory_enabled":  False,
+            "created_at":         datetime.datetime.now().isoformat(),
+        }
+    return settings["_bot_config"]
+
+def is_chat_allowed(settings: dict, chat_id: str, username: str) -> bool:
+    allowed = get_factory_config(settings).get("channels", [])
+    if not allowed:
+        return True
+    return chat_id in allowed or (username and f"@{username}" in allowed)
+
+def get_group(settings: dict, chat_id: str) -> dict:
+    if chat_id not in settings:
+        settings[chat_id] = {
+            "anti_spam": True, "anti_flood": True, "welcome": True,
+            "welcome_msg": "👋 مرحباً {name} في {group}! يسعدنا انضمامك.",
+            "flood_limit": 5, "flood_seconds": 10, "warn_limit": 3,
+            "warnings": {},
+            "stats": {"spam": 0, "flood": 0, "bans": 0, "kicks": 0, "mutes": 0},
+        }
+    g = settings[chat_id]
+    for k, v in [("stats", {}), ("warnings", {}), ("anti_spam", True),
+                 ("anti_flood", True), ("welcome", True), ("warn_limit", 3),
+                 ("flood_limit", 5), ("flood_seconds", 10)]:
+        if k not in g:
+            g[k] = v
+    return g
+
+def track_group(settings: dict, chat) -> bool:
+    """Add group to _groups registry. Returns True if newly added."""
+    groups = settings.setdefault("_groups", {})
+    chat_id = str(chat.id)
+    if chat_id not in groups:
+        groups[chat_id] = {
+            "title":    chat.title or "",
+            "username": getattr(chat, "username", "") or "",
+            "joined":   datetime.datetime.now().isoformat(),
+        }
+        return True
+    return False
+
+def total_stats(settings: dict) -> dict:
+    """Aggregate stats across all groups."""
+    totals = {"spam": 0, "flood": 0, "bans": 0, "kicks": 0, "mutes": 0, "groups": 0}
+    for k, v in settings.items():
+        if k.startswith("_") or not isinstance(v, dict):
+            continue
+        totals["groups"] += 1
+        for stat in ("spam", "flood", "bans", "kicks", "mutes"):
+            totals[stat] += v.get("stats", {}).get(stat, 0)
+    return totals
+
+def is_spam(text: str) -> bool:
+    if URL_RE.search(text):
+        return True
+    low = text.lower()
+    return any(w.lower() in low for w in SPAM_WORDS)
+
+def parse_duration(s: str) -> int | None:
+    m = re.fullmatch(r"(\d+)([smhd])", s.strip().lower())
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+
+async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if msg.reply_to_message:
+        u = msg.reply_to_message.from_user
+        return u.id, u.first_name
+    if context.args:
+        arg = context.args[0].lstrip("@")
+        try:
+            member = await context.bot.get_chat_member(msg.chat_id, arg)
+            return member.user.id, member.user.first_name
+        except Exception:
+            pass
+    return None, None
+
+async def is_admin(bot, chat_id: int, user_id: int) -> bool:
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+        return m.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except Exception:
+        return False
+
+async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not await is_admin(context.bot, update.effective_chat.id, update.effective_user.id):
+        await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
+        return False
+    return True
+
+async def check_mandatory(bot, user_id: int, settings: dict) -> list:
+    """Return list of channel IDs the user is NOT subscribed to."""
+    bc = get_bot_config(settings)
+    if not bc.get("mandatory_enabled", False):
+        return []
+    unsubscribed = []
+    for ch in bc.get("mandatory_channels", []):
+        try:
+            member = await bot.get_chat_member(chat_id=ch, user_id=user_id)
+            if member.status in ("left", "kicked", "banned"):
+                unsubscribed.append(ch)
+        except TelegramError:
+            pass
+    return unsubscribed
+
+# ══════════════════════════════════════════════════════════════════════════════
+# KEYBOARDS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def admin_panel_kb() -> InlineKeyboardMarkup:
+    """Main owner admin panel — 6 feature buttons."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 الإحصائيات",       callback_data="panel_stats"),
+         InlineKeyboardButton("📢 الإذاعة",           callback_data="panel_broadcast")],
+        [InlineKeyboardButton("🔒 الإجباري",          callback_data="panel_mandatory"),
+         InlineKeyboardButton("⚙️ الأوامر الأساسية", callback_data="panel_commands")],
+        [InlineKeyboardButton("💾 النسخ الاحتياطي",  callback_data="panel_backup"),
+         InlineKeyboardButton("🔄 التحديثات",         callback_data="panel_updates")],
+    ])
+
+def mandatory_kb(settings: dict) -> InlineKeyboardMarkup:
+    bc       = get_bot_config(settings)
+    enabled  = bc.get("mandatory_enabled", False)
+    channels = bc.get("mandatory_channels", [])
+    rows     = []
+    rows.append([InlineKeyboardButton(
+        f"{'✅ مفعّل' if enabled else '❌ معطّل'} — اضغط للتبديل",
+        callback_data="panel_mandatory_toggle"
+    )])
+    for i, ch in enumerate(channels):
+        rows.append([
+            InlineKeyboardButton(f"📢 {ch}", callback_data="noop"),
+            InlineKeyboardButton("🗑",        callback_data=f"panel_del_ch::{i}"),
+        ])
+    rows.append([InlineKeyboardButton("➕ إضافة قناة", callback_data="panel_add_ch")])
+    rows.append([InlineKeyboardButton("🔙 رجوع",        callback_data="panel_back")])
+    return InlineKeyboardMarkup(rows)
+
+def settings_kb(g: dict) -> InlineKeyboardMarkup:
+    def icon(v): return "✅" if v else "❌"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{icon(g['anti_spam'])} مكافحة السبام",   callback_data="set_spam"),
+         InlineKeyboardButton(f"{icon(g['anti_flood'])} مكافحة الفيضان", callback_data="set_flood")],
+        [InlineKeyboardButton(f"{icon(g['welcome'])} رسالة الترحيب",     callback_data="set_welcome")],
+        [InlineKeyboardButton(f"⚠️ حد التحذيرات: {g['warn_limit']}",    callback_data="noop"),
+         InlineKeyboardButton(f"🌊 حد الفيضان: {g['flood_limit']} رسالة", callback_data="noop")],
+        [InlineKeyboardButton("🔄 تحديث", callback_data="set_refresh")],
+    ])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HANDLER FACTORY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_handlers(data_file: str, bot_name: str, owner_id: int):
+
+    def is_owner(user_id: int) -> bool:
+        return owner_id != 0 and user_id == owner_id
+
+    # ════════════════════════════════════
+    # /start — owner gets admin panel, others get info card
+    # ════════════════════════════════════
+    async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        settings       = load_settings(data_file)
+        factory_config = get_factory_config(settings)
+        custom_buttons = factory_config.get("custom_buttons", [])
+        user_id        = update.effective_user.id
+
+        if update.effective_chat.type == "private":
+            if is_owner(user_id):
+                # Show full admin panel
+                _state.pop(user_id, None)
+                st = total_stats(settings)
+                groups_count = len(settings.get("_groups", {}))
+                await update.message.reply_text(
+                    f"🛡 *لوحة تحكم البوت*\n\n"
+                    f"الاسم: «{bot_name}»\n"
+                    f"الإصدار: {BOT_VERSION}\n\n"
+                    f"📊 إجمالي:\n"
+                    f"  👥 مجموعات: {groups_count}\n"
+                    f"  🚫 سبام: {st['spam']} | 🌊 فيضان: {st['flood']}\n"
+                    f"  🔨 حظر: {st['bans']} | 👢 طرد: {st['kicks']} | 🔇 كتم: {st['mutes']}",
+                    parse_mode="Markdown",
+                    reply_markup=admin_panel_kb(),
+                )
+            else:
+                # Regular users: info card + custom buttons
+                kb = None
+                if custom_buttons:
+                    rows = [[InlineKeyboardButton(b["text"], url=b["url"])]
+                            for b in custom_buttons if b.get("url")]
+                    if rows:
+                        kb = InlineKeyboardMarkup(rows)
+                await update.message.reply_text(
+                    f"👋 أنا «{bot_name}» — بوت حماية المجموعات.\n\n"
+                    "أضفني لمجموعتك كمشرف:\n"
+                    "🚫 حذف السبام والإعلانات\n"
+                    "🌊 إيقاف الفيضان\n"
+                    "👋 ترحيب بالأعضاء الجدد\n\n"
+                    "أوامر المشرفين:\n"
+                    "/ban /kick /mute /unmute /warn /unwarn /settings",
+                    reply_markup=kb,
+                )
+        else:
+            # In groups: show status
+            chat_id = str(update.effective_chat.id)
+            g       = get_group(settings, chat_id)
+            def icon(v): return "✅" if v else "❌"
+            kb = None
+            if custom_buttons:
+                rows = [[InlineKeyboardButton(b["text"], url=b["url"])]
+                        for b in custom_buttons if b.get("url")]
+                if rows:
+                    kb = InlineKeyboardMarkup(rows)
+            await update.message.reply_text(
+                f"🛡 *{bot_name}* — بوت الحماية\n\n"
+                f"{icon(g['anti_spam'])} مكافحة السبام\n"
+                f"{icon(g['anti_flood'])} مكافحة الفيضان\n"
+                f"{icon(g['welcome'])} رسالة الترحيب\n\n"
+                f"أوامر المشرفين: /ban /kick /mute /warn /settings",
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+
+# ════════════════════════════════════
+    # Private text messages (state machine for owner)
+    # ════════════════════════════════════
+    async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not is_owner(user_id):
+            return
+        state_info = _state.get(user_id, {})
+        state      = state_info.get("state")
+        text       = update.message.text.strip()
+
+        if state == "broadcast_msg":
+            settings = load_settings(data_file)
+            groups   = settings.get("_groups", {})
+            sent = failed = 0
+            for gid in groups:
+                try:
+                    await ctx.bot.send_message(int(gid), text)
+                    sent += 1
+                except Exception:
+                    failed += 1
+            _state.pop(user_id, None)
+            await update.message.reply_text(
+                f"📢 *اكتملت الإذاعة*\n\n✅ أُرسلت إلى: {sent} مجموعة\n❌ فشل: {failed}",
+                parse_mode="Markdown",
+                reply_markup=admin_panel_kb(),
+            )
+
+        elif state == "add_mandatory_ch":
+            ch = text.strip()
+            if not (ch.startswith("@") or ch.startswith("-")):
+                await update.message.reply_text(
+                    "❌ يجب أن يبدأ المعرف بـ @ أو رقم سالب (ID)\nأرسله مرة أخرى:"
+                )
+                return
+            settings = load_settings(data_file)
+            bc = get_bot_config(settings)
+            if ch not in bc.get("mandatory_channels", []):
+                bc.setdefault("mandatory_channels", []).append(ch)
+                save_settings(data_file, settings)
+            _state.pop(user_id, None)
+            await update.message.reply_text(
+                f"✅ تمت إضافة القناة الإجبارية: {ch}",
+                parse_mode="Markdown",
+                reply_markup=mandatory_kb(settings),
+            )
+
+    # ════════════════════════════════════
+    # Callback handler (groups + private)
+    # ════════════════════════════════════
+    async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q   = update.callback_query
+        await q.answer()
+        key     = q.data
+        user_id = update.effective_user.id
+
+        # ── Owner admin panel callbacks (private only) ──────────────────────
+        if key == "panel_back":
+            if not is_owner(user_id):
+                return
+            _state.pop(user_id, None)
+            settings = load_settings(data_file)
+            st = total_stats(settings)
+            groups_count = len(settings.get("_groups", {}))
+            await q.edit_message_text(
+                f"🛡 *لوحة تحكم البوت*\n\n"
+                f"الاسم: «{bot_name}» | الإصدار: {BOT_VERSION}\n\n"
+                f"📊 إجمالي:\n"
+                f"  👥 مجموعات: {groups_count}\n"
+                f"  🚫 سبام: {st['spam']} | 🌊 فيضان: {st['flood']}\n"
+                f"  🔨 حظر: {st['bans']} | 👢 طرد: {st['kicks']} | 🔇 كتم: {st['mutes']}",
+                parse_mode="Markdown",
+                reply_markup=admin_panel_kb(),
+            )
+
+        elif key == "panel_stats":
+            if not is_owner(user_id):
+                return
+            settings     = load_settings(data_file)
+            st           = total_stats(settings)
+            groups       = settings.get("_groups", {})
+            groups_count = len(groups)
+            lines        = [f"📊 *إحصائيات «{bot_name}»*\n"]
+            lines.append(f"👥 مجموعات: {groups_count}")
+            lines.append(f"🚫 سبام محذوف: {st['spam']}")
+            lines.append(f"🌊 فيضان موقوف: {st['flood']}")
+            lines.append(f"🔨 حظر: {st['bans']}")
+            lines.append(f"👢 طرد: {st['kicks']}")
+            lines.append(f"🔇 كتم: {st['mutes']}")
+            if groups:
+
+lines.append("\n📋 *المجموعات:*")
+                for gid, info in list(groups.items())[:10]:
+                    title = info.get("title", gid)
+                    lines.append(f"  • {title}")
+            await q.edit_message_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 رجوع", callback_data="panel_back")
+                ]]),
+            )
+
+        elif key == "panel_broadcast":
+            if not is_owner(user_id):
+                return
+            settings = load_settings(data_file)
+            groups   = settings.get("_groups", {})
+            if not groups:
+                await q.edit_message_text(
+                    "⚠️ لا توجد مجموعات بعد.\nأضف البوت لمجموعة أولاً.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 رجوع", callback_data="panel_back")
+                    ]]),
+                )
+                return
+            _state[user_id] = {"state": "broadcast_msg"}
+            await q.edit_message_text(
+                f"📢 *إذاعة رسالة*\n\n"
+                f"ستُرسل لـ {len(groups)} مجموعة.\n\n"
+                f"أرسل الرسالة الآن:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ إلغاء", callback_data="panel_back")
+                ]]),
+            )
+
+        elif key == "panel_mandatory":
+            if not is_owner(user_id):
+                return
+            settings = load_settings(data_file)
+            bc       = get_bot_config(settings)
+            status   = "✅ مفعّل" if bc.get("mandatory_enabled") else "❌ معطّل"
+            chs      = bc.get("mandatory_channels", [])
+            await q.edit_message_text(
+                f"🔒 *الاشتراك الإجباري*\n\n"
+                f"الحالة: {status}\n"
+                f"القنوات: {len(chs)}\n\n"
+                f"عند التفعيل: يتم إرسال تنبيه لكل عضو غير مشترك في القنوات المحددة.",
+                parse_mode="Markdown",
+                reply_markup=mandatory_kb(settings),
+            )
+
+        elif key == "panel_mandatory_toggle":
+            if not is_owner(user_id):
+                return
+            settings = load_settings(data_file)
+            bc       = get_bot_config(settings)
+            bc["mandatory_enabled"] = not bc.get("mandatory_enabled", False)
+            save_settings(data_file, settings)
+            status = "✅ مفعّل" if bc["mandatory_enabled"] else "❌ معطّل"
+            await q.edit_message_text(
+                f"🔒 *الاشتراك الإجباري* — {status}",
+                parse_mode="Markdown",
+                reply_markup=mandatory_kb(settings),
+            )
+
+        elif key == "panel_add_ch":
+            if not is_owner(user_id):
+                return
+            _state[user_id] = {"state": "add_mandatory_ch"}
+            await q.edit_message_text(
+                "🔒 *إضافة قناة إجبارية*\n\n"
+                "أرسل معرف القناة:\n"
+                "• @channel_username\n"
+                "• أو ID رقمي سالب مثل -1001234567890",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ إلغاء", callback_data="panel_mandatory")
+                ]]),
+            )
+
+        elif key.startswith("panel_del_ch::"):
+            if not is_owner(user_id):
+                return
+            idx      = int(key.split("::", 1)[1])
+            settings = load_settings(data_file)
+            bc       = get_bot_config(settings)
+            chs      = bc.get("mandatory_channels", [])
+            if 0 <= idx < len(chs):
+                chs.pop(idx)
+                bc["mandatory_channels"] = chs
+                save_settings(data_file, settings)
+            await q.edit_message_text(
+                "🔒 *الاشتراك الإجباري*",
+                parse_mode="Markdown",
+                reply_markup=mandatory_kb(settings),
+            )
+
+elif key == "panel_commands":
+            if not is_owner(user_id):
+                return
+            await q.edit_message_text(
+                f"⚙️ *الأوامر الأساسية لـ «{bot_name}»*\n\n"
+                f"*أوامر المشرفين (داخل المجموعة):*\n"
+                f"/ban @user — حظر دائم\n"
+                f"/unban @user — رفع الحظر\n"
+                f"/kick @user — طرد (يمكن العودة)\n"
+                f"/mute @user [30m/2h/1d] — كتم\n"
+                f"/unmute @user — رفع الكتم\n"
+                f"/warn @user [سبب] — تحذير\n"
+                f"/unwarn @user — إلغاء تحذير\n"
+                f"/warnings @user — عرض التحذيرات\n"
+                f"/settings — لوحة الإعدادات\n"
+                f"/setwelcome نص — تعيين رسالة ترحيب\n"
+                f"/togglespam — تفعيل/إيقاف فلتر السبام\n"
+                f"/toggleflood — تفعيل/إيقاف فلتر الفيضان\n"
+                f"/togglewelcome — تفعيل/إيقاف الترحيب\n"
+                f"/setwarnlimit [رقم] — حد التحذيرات\n"
+                f"/setfloodlimit [رقم] — حد الرسائل/10ث",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 رجوع", callback_data="panel_back")
+                ]]),
+            )
+
+        elif key == "panel_backup":
+            if not is_owner(user_id):
+                return
+            settings = load_settings(data_file)
+            raw      = json.dumps(settings, ensure_ascii=False, indent=2).encode("utf-8")
+            ts       = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname    = f"backup_{bot_name}_{ts}.json"
+            await ctx.bot.send_document(
+                chat_id=user_id,
+                document=InputFile(io.BytesIO(raw), filename=fname),
+                caption=f"💾 *نسخة احتياطية — «{bot_name}»*\n{ts}",
+                parse_mode="Markdown",
+            )
+            await q.edit_message_text(
+                "💾 تم إرسال ملف البيانات كنسخة احتياطية ✅",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 رجوع", callback_data="panel_back")
+                ]]),
+            )
+
+        elif key == "panel_updates":
+            if not is_owner(user_id):
+                return
+            settings = load_settings(data_file)
+            bc       = get_bot_config(settings)
+            created  = bc.get("created_at", "—")
+            await q.edit_message_text(
+                f"🔄 *معلومات البوت*\n\n"
+                f"الاسم: «{bot_name}»\n"
+                f"الإصدار: {BOT_VERSION}\n"
+                f"تاريخ الإنشاء: {created[:10] if created != '—' else '—'}\n\n"
+                f"*المصنع:* Axon Bot Factory\n"
+                f"*المحرك:* python-telegram-bot 22.x\n\n"
+                f"✅ البوت يعمل بأحدث إصدار.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 رجوع", callback_data="panel_back")
+                ]]),
+            )
+
+        # ── Group settings callbacks ────────────────────────────────────────
+        elif key in ("set_spam", "set_flood", "set_welcome", "set_refresh"):
+            chat_id = str(update.effective_chat.id)
+            if not await is_admin(ctx.bot, update.effective_chat.id, user_id):
+                await q.answer("⛔ للمشرفين فقط", show_alert=True)
+                return
+            settings = load_settings(data_file)
+            g        = get_group(settings, chat_id)
+            if key == "set_spam":
+                g["anti_spam"] = not g["anti_spam"]
+            elif key == "set_flood":
+                g["anti_flood"] = not g["anti_flood"]
+            elif key == "set_welcome":
+                g["welcome"] = not g["welcome"]
+            save_settings(data_file, settings)
+
+stats = g.get("stats", {})
+            await q.edit_message_text(
+                f"⚙️ إعدادات «{bot_name}»:\n\n"
+                f"📊 سبام: {stats.get('spam',0)} | فيضان: {stats.get('flood',0)} | "
+                f"حظر: {stats.get('bans',0)}",
+                reply_markup=settings_kb(g),
+            )
+
+        elif key == "noop":
+            pass
+
+    # ════════════════════════════════════
+    # Welcome new members + track group
+    # ════════════════════════════════════
+    async def on_new_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat     = update.effective_chat
+        chat_id  = str(chat.id)
+        settings = load_settings(data_file)
+
+        if not is_chat_allowed(settings, chat_id, chat.username or ""):
+            return
+
+        changed = track_group(settings, chat)
+        if changed:
+            save_settings(data_file, settings)
+
+        g = get_group(settings, chat_id)
+        if not g["welcome"]:
+            return
+        group_name = chat.title or "المجموعة"
+        for member in update.message.new_chat_members:
+            if member.is_bot:
+                continue
+            name    = member.first_name or member.username or "عضو"
+            mention = f"[{name}](tg://user?id={member.id})"
+            msg     = g["welcome_msg"].replace("{name}", mention).replace("{group}", group_name)
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+    # ════════════════════════════════════
+    # Anti-spam / Anti-flood message filter
+    # ════════════════════════════════════
+    async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        msg = update.message
+        if not msg or not msg.from_user:
+            return
+        chat    = update.effective_chat
+        user    = msg.from_user
+        chat_id = str(chat.id)
+        settings = load_settings(data_file)
+
+        if not is_chat_allowed(settings, chat_id, chat.username or ""):
+            return
+
+        # Track group
+        if track_group(settings, chat):
+            save_settings(data_file, settings)
+
+        g = get_group(settings, chat_id)
+
+        # Skip admins and bot owner
+        if await is_admin(ctx.bot, chat.id, user.id) or is_owner(user.id):
+            return
+
+        text = msg.text or msg.caption or ""
+
+        # ── Mandatory subscription check ──
+        unsubscribed = await check_mandatory(ctx.bot, user.id, settings)
+        if unsubscribed:
+            ch_list = "\n".join(
+                [f"• [اشترك هنا](https://t.me/{c.lstrip('@')})" for c in unsubscribed]
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"📢 اشترك في {c}",
+                    url=f"https://t.me/{c.lstrip('@')}"
+                )] for c in unsubscribed
+            ])
+            await chat.send_message(
+                f"⛔ [{user.first_name}](tg://user?id={user.id})، "
+                f"يجب الاشتراك في القنوات التالية للمشاركة:\n{ch_list}",
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            return
+
+        # ── Anti-spam ──
+        if g["anti_spam"] and is_spam(text):
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            g["stats"]["spam"] = g["stats"].get("spam", 0) + 1
+            uid_str = str(user.id)
+            g["warnings"][uid_str] = g["warnings"].get(uid_str, 0) + 1
+            warns      = g["warnings"][uid_str]
+            warn_limit = g.get("warn_limit", 3)
+            if warns >= warn_limit:
+                try:
+                    await ctx.bot.ban_chat_member(chat.id, user.id)
+                    g["stats"]["bans"] = g["stats"].get("bans", 0) + 1
+
+g["warnings"][uid_str] = 0
+                    await chat.send_message(
+                        f"🚫 تم حظر [{user.first_name}](tg://user?id={user.id}) "
+                        f"بسبب تكرار السبام ({warn_limit} تحذيرات).",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+            else:
+                remaining = warn_limit - warns
+                await chat.send_message(
+                    f"⚠️ [{user.first_name}](tg://user?id={user.id}) "
+                    f"تحذير {warns}/{warn_limit} — رسالة مزعجة. ({remaining} متبقية قبل الحظر)",
+                    parse_mode="Markdown",
+                )
+            save_settings(data_file, settings)
+            return
+
+        # ── Anti-flood ──
+        if g["anti_flood"]:
+            now    = datetime.datetime.now().timestamp()
+            limit  = g.get("flood_limit", 5)
+            window = g.get("flood_seconds", 10)
+            dq     = _flood[chat_id][str(user.id)]
+            dq.append(now)
+            while dq and dq[0] < now - window:
+                dq.popleft()
+            if len(dq) >= limit:
+                dq.clear()
+                try:
+                    until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
+                    await ctx.bot.restrict_chat_member(
+                        chat.id, user.id,
+                        permissions=ChatPermissions(can_send_messages=False),
+                        until_date=until,
+                    )
+                    g["stats"]["mutes"]  = g["stats"].get("mutes", 0) + 1
+                    g["stats"]["flood"]  = g["stats"].get("flood", 0) + 1
+                    save_settings(data_file, settings)
+                    await chat.send_message(
+                        f"🌊 [{user.first_name}](tg://user?id={user.id}) "
+                        f"تم كتمه لمدة ساعة بسبب الفيضان.",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+
+    # ════════════════════════════════════
+    # Admin commands
+    # ════════════════════════════════════
+    async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await require_admin(update, ctx): return
+        uid, name = await resolve_target(update, ctx)
+        if not uid:
+            await update.message.reply_text("❗ استخدم: /ban @user أو رد على رسالته"); return
+        reason = " ".join((ctx.args or [])[1:]) or "بدون سبب"
+        try:
+            await ctx.bot.ban_chat_member(update.effective_chat.id, uid)
+            chat_id  = str(update.effective_chat.id)
+            settings = load_settings(data_file)
+            g = get_group(settings, chat_id)
+            g["stats"]["bans"] = g["stats"].get("bans", 0) + 1
+            save_settings(data_file, settings)
+            await update.message.reply_text(
+                f"🚫 تم حظر [{name}](tg://user?id={uid})\nالسبب: {reason}",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ فشل الحظر: {e}")
+
+    async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await require_admin(update, ctx): return
+        uid, name = await resolve_target(update, ctx)
+        if not uid:
+            await update.message.reply_text("❗ استخدم: /unban @user"); return
+        try:
+            await ctx.bot.unban_chat_member(update.effective_chat.id, uid, only_if_banned=True)
+            await update.message.reply_text(
+                f"✅ تم رفع الحظر عن [{name}](tg://user?id={uid})", parse_mode="Markdown")
+        except Exception as e:
+            await update.message.reply_text(f"❌ فشل: {e}")
+
+    async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+
+if not await require_admin(update, ctx): return
+        uid, name = await resolve_target(update, ctx)
+        if not uid:
+            await update.message.reply_text("❗ استخدم: /kick @user"); return
+        try:
+            await ctx.bot.ban_chat_member(update.effective_chat.id, uid)
+            await ctx.bot.unban_chat_member(update.effective_chat.id, uid)
+            chat_id  = str(update.effective_chat.id)
+            settings = load_settings(data_file)
+            g = get_group(settings, chat_id)
+            g["stats"]["kicks"] = g["stats"].get("kicks", 0) + 1
+            save_settings(data_file, settings)
+            await update.message.reply_text(
+                f"👢 تم طرد [{name}](tg://user?id={uid})", parse_mode="Markdown")
+        except Exception as e:
+            await update.message.reply_text(f"❌ فشل: {e}")
+
+    async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await require_admin(update, ctx): return
+        uid, name = await resolve_target(update, ctx)
+        if not uid:
+            await update.message.reply_text("❗ استخدم: /mute @user [30m/2h/1d]"); return
+        duration = None
+        for arg in (ctx.args or []):
+            duration = parse_duration(arg)
+            if duration: break
+        until    = None
+        dur_text = "دائم"
+        if duration:
+            until    = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=duration)
+            dur_text = f"{ctx.args[0]}" if ctx.args else ""
+        try:
+            await ctx.bot.restrict_chat_member(
+                update.effective_chat.id, uid,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=until,
+            )
+            chat_id  = str(update.effective_chat.id)
+            settings = load_settings(data_file)
+            get_group(settings, chat_id)["stats"]["mutes"] = \
+                settings[chat_id]["stats"].get("mutes", 0) + 1
+            save_settings(data_file, settings)
+            await update.message.reply_text(
+                f"🔇 تم كتم [{name}](tg://user?id={uid}) — {dur_text}", parse_mode="Markdown")
+        except Exception as e:
+            await update.message.reply_text(f"❌ فشل: {e}")
+
+    async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await require_admin(update, ctx): return
+        uid, name = await resolve_target(update, ctx)
+        if not uid:
+            await update.message.reply_text("❗ استخدم: /unmute @user"); return
+        try:
+            await ctx.bot.restrict_chat_member(
+                update.effective_chat.id, uid,
+                permissions=ChatPermissions(
+                    can_send_messages=True, can_send_media_messages=True,
+                    can_send_other_messages=True, can_add_web_page_previews=True,
+                ),
+            )
+            await update.message.reply_text(
+                f"🔊 تم رفع الكتم عن [{name}](tg://user?id={uid})", parse_mode="Markdown")
+        except Exception as e:
+            await update.message.reply_text(f"❌ فشل: {e}")
+
+    async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await require_admin(update, ctx): return
+        uid, name = await resolve_target(update, ctx)
+        if not uid:
+            await update.message.reply_text("❗ استخدم: /warn @user [سبب]"); return
+        reason   = " ".join((ctx.args or [])[1:]) or "بدون سبب"
+        chat_id  = str(update.effective_chat.id)
+        settings = load_settings(data_file)
+        g        = get_group(settings, chat_id)
+        uid_str  = str(uid)
+        g["warnings"][uid_str] = g["warnings"].get(uid_str, 0) + 1
+        warns      = g["warnings"][uid_str]
+        warn_limit = g.get("warn_limit", 3)
+        save_settings(data_file, settings)
+
+if warns >= warn_limit:
+            try:
+                await ctx.bot.ban_chat_member(update.effective_chat.id, uid)
+                g["warnings"][uid_str] = 0
+                save_settings(data_file, settings)
+                await update.message.reply_text(
+                    f"🚫 [{name}](tg://user?id={uid}) وصل للحد الأقصى ({warn_limit}) — تم الحظر!",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                await update.message.reply_text(f"❌ فشل: {e}")
+        else:
+            await update.message.reply_text(
+                f"⚠️ تحذير لـ [{name}](tg://user?id={uid}): {warns}/{warn_limit}\nالسبب: {reason}",
+                parse_mode="Markdown",
+            )
+
+    async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await require_admin(update, ctx): return
+        uid, name = await resolve_target(update, ctx)
+        if not uid:
+            await update.message.reply_text("❗ استخدم: /unwarn @user"); return
+        chat_id  = str(update.effective_chat.id)
+        settings = load_settings(data_file)
+        g        = get_group(settings, chat_id)
+        uid_str  = str(uid)
+        if g["warnings"].get(uid_str, 0) > 0:
+            g["warnings"][uid_str] -= 1
+            save_settings(data_file, settings)
+        await update.message.reply_text(
+            f"✅ تم إزالة تحذير — [{name}](tg://user?id={uid}) المتبقي: {g['warnings'].get(uid_str,0)}",
+            parse_mode="Markdown",
+        )
+
+    async def cmd_warnings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        uid, name = await resolve_target(update, ctx)
+        if not uid:
+            await update.message.reply_text("❗ استخدم: /warnings @user"); return
+        chat_id  = str(update.effective_chat.id)
+        settings = load_settings(data_file)
+        g        = get_group(settings, chat_id)
+        warns    = g["warnings"].get(str(uid), 0)
+        limit    = g.get("warn_limit", 3)
+        await update.message.reply_text(
+            f"⚠️ تحذيرات [{name}](tg://user?id={uid}): {warns}/{limit}",
+            parse_mode="Markdown",
+        )
+
+    async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await require_admin(update, ctx): return
+        chat_id  = str(update.effective_chat.id)
+        settings = load_settings(data_file)
+        g        = get_group(settings, chat_id)
+        save_settings(data_file, settings)
+        stats = g.get("stats", {})
+        await update.message.reply_text(
+            f"⚙️ إعدادات «{bot_name}» في هذه المجموعة:\n\n"
+            f"📊 سبام: {stats.get('spam',0)} | فيضان: {stats.get('flood',0)}\n"
+            f"  حظر: {stats.get('bans',0)} | طرد: {stats.get('kicks',0)} | كتم: {stats.get('mutes',0)}\n\n"
+            f"اضغط الأزرار للتبديل:",
+            reply_markup=settings_kb(g),
+        )
+
+    async def cmd_setwelcome(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await require_admin(update, ctx): return
+        if not ctx.args:
+            await update.message.reply_text(
+                "❗ استخدم: /setwelcome رسالتك\nيمكن استخدام {name} و {group}"); return
+        msg_text = " ".join(ctx.args)
+        chat_id  = str(update.effective_chat.id)
+        settings = load_settings(data_file)
+        get_group(settings, chat_id)["welcome_msg"] = msg_text
+        save_settings(data_file, settings)
+        await update.message.reply_text(f"✅ تم تعيين رسالة الترحيب:\n{msg_text}")
+
+    async def cmd_togglespam(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await require_admin(update, ctx): return
+        chat_id  = str(update.effective_chat.id)
+        settings = load_settings(data_file)
+        g        = get_group(settings, chat_id)
+        g["anti_spam"] = not g["anti_spam"]
+        save_settings(data_file, settings)
+        await update.message.reply_text(f"🚫 مكافحة السبام: {'✅ مفعّل' if g['anti_spam'] else '❌ معطّل'}")
+
+async def cmd_toggleflood(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await require_admin(update, ctx): return
+        chat_id  = str(update.effective_chat.id)
+        settings = load_settings(data_file)
+        g        = get_group(settings, chat_id)
+        g["anti_flood"] = not g["anti_flood"]
+        save_settings(data_file, settings)
+        await update.message.reply_text(f"🌊 مكافحة الفيضان: {'✅ مفعّل' if g['anti_flood'] else '❌ معطّل'}")
+
+    async def cmd_togglewelcome(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await require_admin(update, ctx): return
+        chat_id  = str(update.effective_chat.id)
+        settings = load_settings(data_file)
+        g        = get_group(settings, chat_id)
+        g["welcome"] = not g["welcome"]
+        save_settings(data_file, settings)
+        await update.message.reply_text(f"👋 الترحيب: {'✅ مفعّل' if g['welcome'] else '❌ معطّل'}")
+
+    async def cmd_setwarnlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await require_admin(update, ctx): return
+        if not ctx.args or not ctx.args[0].isdigit():
+            await update.message.reply_text("❗ استخدم: /setwarnlimit 3"); return
+        n        = max(1, min(10, int(ctx.args[0])))
+        chat_id  = str(update.effective_chat.id)
+        settings = load_settings(data_file)
+        get_group(settings, chat_id)["warn_limit"] = n
+        save_settings(data_file, settings)
+        await update.message.reply_text(f"✅ حد التحذيرات: {n}")
+
+    async def cmd_setfloodlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await require_admin(update, ctx): return
+        if not ctx.args or not ctx.args[0].isdigit():
+            await update.message.reply_text("❗ استخدم: /setfloodlimit 5"); return
+        n        = max(2, min(20, int(ctx.args[0])))
+        chat_id  = str(update.effective_chat.id)
+        settings = load_settings(data_file)
+        get_group(settings, chat_id)["flood_limit"] = n
+        save_settings(data_file, settings)
+        await update.message.reply_text(f"✅ حد الفيضان: {n} رسائل")
+
+    return [
+        CommandHandler("start",          cmd_start),
+        CommandHandler("help",           cmd_start),
+        CommandHandler("ban",            cmd_ban),
+        CommandHandler("unban",          cmd_unban),
+        CommandHandler("kick",           cmd_kick),
+        CommandHandler("mute",           cmd_mute),
+        CommandHandler("unmute",         cmd_unmute),
+        CommandHandler("warn",           cmd_warn),
+        CommandHandler("unwarn",         cmd_unwarn),
+        CommandHandler("warnings",       cmd_warnings),
+        CommandHandler("settings",       cmd_settings),
+        CommandHandler("setwelcome",     cmd_setwelcome),
+        CommandHandler("togglespam",     cmd_togglespam),
+        CommandHandler("toggleflood",    cmd_toggleflood),
+        CommandHandler("togglewelcome",  cmd_togglewelcome),
+        CommandHandler("setwarnlimit",   cmd_setwarnlimit),
+        CommandHandler("setfloodlimit",  cmd_setfloodlimit),
+        MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_member),
+        MessageHandler(
+            filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+            on_private_text,
+        ),
+        MessageHandler(
+            filters.TEXT & filters.ChatType.GROUPS,
+            on_message,
+        ),
+        CallbackQueryHandler(on_callback),
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_bot(token: str, data_file: str, bot_name: str, owner_id: int = 0) -> None:
+    """Synchronous entry — app.run_polling() manages its own event loop."""
+    os.makedirs(os.path.dirname(os.path.abspath(data_file)), exist_ok=True)
+
+# Initialise bot_config on first run
+    settings = load_settings(data_file)
+    bc = get_bot_config(settings)
+    if "created_at" not in bc:
+        bc["created_at"] = datetime.datetime.now().isoformat()
+        save_settings(data_file, settings)
+
+    app = Application.builder().token(token).build()
+    for h in make_handlers(data_file, bot_name, owner_id):
+        app.add_handler(h)
+    logger.info(f"Protection bot «{bot_name}» started. owner_id={owner_id}")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--token",     required=True)
+    parser.add_argument("--data-file", required=True)
+    parser.add_argument("--name",      required=True)
+    parser.add_argument("--owner-id",  type=int, default=0)
+    args = parser.parse_args()
+    run_bot(args.token, args.data_file, args.name, args.owner_id)
+
+
+if name == "main":
+    main()
